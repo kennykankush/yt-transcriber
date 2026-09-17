@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""ytx - transcribe a local media file or a URL with whisper.cpp.
+
+Optionally labels speakers by running a separate diarization pass and merging
+the result onto the transcript by timestamp. See README.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HOME = Path.home()
+DEFAULT_OUT = HOME / "Desktop" / "transcriptions"
+
+WHISPER_MODELS = ("ggml-large-v3-turbo.bin", "ggml-medium.bin", "ggml-small.bin")
+VAD_MODELS = (
+    "ggml-silero-v6.2.0.bin",
+    "ggml-silero-v5.1.2.bin",
+    "for-tests-silero-v6.2.0-ggml.bin",
+)
+URL_RE = re.compile(r"^(https?://|www\.|youtube\.com/|youtu\.be/)", re.I)
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+def die(msg: str) -> None:
+    log(f"ytx: {msg}")
+    raise SystemExit(1)
+
+
+def model_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    if os.environ.get("YTX_MODELS"):
+        dirs.append(Path(os.environ["YTX_MODELS"]).expanduser())
+    dirs.append(REPO / "models")
+    dirs.append(HOME / "dev" / "whisperccp" / "models")
+    return dirs
+
+
+def find_model(names: tuple[str, ...]) -> Path | None:
+    for directory in model_dirs():
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def whisper_cli() -> Path:
+    if os.environ.get("YTX_WHISPER_CLI"):
+        candidate = Path(os.environ["YTX_WHISPER_CLI"]).expanduser()
+        if candidate.is_file():
+            return candidate
+    built = HOME / "dev" / "whisperccp" / "build" / "bin" / "whisper-cli"
+    if built.is_file():
+        return built
+    found = shutil.which("whisper-cli")
+    if found:
+        return Path(found)
+    die("whisper-cli not found. Build whisper.cpp or set YTX_WHISPER_CLI.")
+
+
+def sherpa_python() -> Path:
+    if os.environ.get("YTX_PYTHON"):
+        candidate = Path(os.environ["YTX_PYTHON"]).expanduser()
+        if candidate.is_file():
+            return candidate
+    venv_python = REPO / ".venv" / "bin" / "python"
+    if venv_python.is_file():
+        return venv_python
+    die("speaker labels need the sherpa-onnx environment. Run ./bootstrap.sh once.")
+
+
+def safe_name(text: str) -> str:
+    text = text.replace("/", "-")
+    text = re.sub(r"[^A-Za-z0-9 ._-]", "", text)
+    return re.sub(r"\s+", "-", text.strip()) or "transcript"
+
+
+def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, **kwargs)
+
+
+def yt_dlp_base(*extra: str) -> list[str]:
+    cmd = ["yt-dlp", "--no-warnings", "--no-playlist", *extra]
+    if os.environ.get("YTX_YTDLP_ARGS"):
+        cmd += shlex.split(os.environ["YTX_YTDLP_ARGS"])
+    cookies = os.environ.get("TRANSCRIBE_COOKIES")
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    return cmd
+
+
+# YouTube's default web client intermittently answers media requests with 403.
+# The android client is a reliable fallback, so try it automatically before
+# bothering the user about cookies.
+FALLBACK_PLAYER = ["--extractor-args", "youtube:player_client=android"]
+
+
+def fetch_url(url: str, workdir: Path) -> tuple[str, Path]:
+    """Download a URL's audio with yt-dlp. Returns (title, downloaded file)."""
+    if not shutil.which("yt-dlp"):
+        die("yt-dlp not installed (brew install yt-dlp)")
+    title = run(
+        yt_dlp_base("--print", "%(title)s", url),
+        capture_output=True,
+        text=True,
+    ).stdout.strip().splitlines()
+    title = title[0] if title else ""
+
+    template = workdir / "source.%(ext)s"
+    result = run(yt_dlp_base("-f", "bestaudio/best", "-o", str(template), url))
+    if result.returncode != 0:
+        log("ytx: download failed, retrying with the android player client...")
+        result = run(
+            yt_dlp_base(
+                *FALLBACK_PLAYER, "-f", "bestaudio/best", "-o", str(template), url
+            )
+        )
+    if result.returncode != 0:
+        log(
+            "ytx: download failed. If YouTube is asking you to confirm you're not a bot, "
+            "retry with TRANSCRIBE_COOKIES=chrome ytx ..."
+        )
+        raise SystemExit(1)
+
+    downloaded = [p for p in workdir.glob("source.*") if p.is_file()]
+    if not downloaded:
+        die("yt-dlp reported success but produced no file")
+    return title, downloaded[0]
+
+
+def to_wav16k(src: Path, dest: Path) -> None:
+    result = run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src), "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(dest),
+        ]
+    )
+    if result.returncode != 0:
+        die(f"ffmpeg could not convert {src}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="ytx",
+        description="Transcribe a local file or URL. Add --speakers to label who spoke.",
+        epilog=(
+            "--speakers optionally takes a speaker count, e.g. --speakers 2. "
+            "It is also available as --speaker-count 2."
+        ),
+    )
+    parser.add_argument("source", help="local media file or URL")
+    parser.add_argument(
+        "output_dir", nargs="?", default=os.environ.get("YTX_OUT", str(DEFAULT_OUT)),
+        help=f"where to write results (default: {DEFAULT_OUT})",
+    )
+    parser.add_argument(
+        "--speakers", action="store_true",
+        help="label speakers (implies a diarization pass)",
+    )
+    parser.add_argument(
+        "--speaker-count", type=int, default=None, metavar="N",
+        help="expected number of speakers; skips clustering when >1",
+    )
+    parser.add_argument(
+        "--lang", default=os.environ.get("TRANSCRIBE_LANG", "auto"),
+        help="spoken language, e.g. en (default: auto)",
+    )
+    parser.add_argument("--model", help="path to a ggml whisper model")
+    parser.add_argument(
+        "--vad", action="store_true",
+        default=os.environ.get("TRANSCRIBE_VAD", "") not in ("", "0"),
+        help="skip silence with Silero VAD (avoids invented text on silent stretches)",
+    )
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--keep-audio", action="store_true", help="keep the 16 kHz WAV")
+    return parser.parse_args(normalise_speakers(argv))
+
+
+def normalise_speakers(argv: list[str]) -> list[str]:
+    """Rewrite `--speakers 3` to `--speakers --speaker-count 3`.
+
+    argparse cannot take an optional value before a positional argument - it
+    would try to read the source path as the count - so the rewrite happens
+    before parsing.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--speakers" and index + 1 < len(argv) and argv[index + 1].isdigit():
+            out += ["--speakers", "--speaker-count", argv[index + 1]]
+            index += 2
+            continue
+        out.append(token)
+        index += 1
+    return out
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+
+    if shutil.which("ffmpeg") is None:
+        die("ffmpeg not found (brew install ffmpeg)")
+
+    model = Path(args.model).expanduser() if args.model else find_model(WHISPER_MODELS)
+    if not model or not model.is_file():
+        die(f"no whisper model found in: {', '.join(str(d) for d in model_dirs())}")
+
+    outdir = Path(args.output_dir).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    source = args.source
+    is_url = bool(URL_RE.match(source))
+    if is_url and not source.startswith(("http://", "https://")):
+        source = "https://" + source
+    if not is_url and not Path(source).expanduser().is_file():
+        die(f"file not found: {source}")
+
+    workdir = Path(tempfile.mkdtemp(prefix="ytx-"))
+    try:
+        if is_url:
+            title, downloaded = fetch_url(source, workdir)
+            base = safe_name(title)
+            log(f"downloaded: {title or base}")
+            src_media = downloaded
+        else:
+            src_media = Path(source).expanduser()
+            base = safe_name(src_media.stem)
+
+        wav = workdir / "audio.wav"
+        log("converting to 16 kHz mono WAV...")
+        to_wav16k(src_media, wav)
+        if args.keep_audio:
+            shutil.copy2(wav, outdir / f"{base}.wav")
+
+        out_base = outdir / base
+        cmd = [
+            str(whisper_cli()), "-m", str(model), "-f", str(wav),
+            "-otxt", "-osrt", "-of", str(out_base),
+            "-l", args.lang, "-t", str(args.threads), "-pp",
+        ]
+        if args.vad:
+            vad_model = find_model(VAD_MODELS) or (
+                Path(os.environ["TRANSCRIBE_VAD_MODEL"]).expanduser()
+                if os.environ.get("TRANSCRIBE_VAD_MODEL") else None
+            )
+            if not vad_model or not vad_model.is_file():
+                die("--vad requested but no Silero VAD model found (run ./bootstrap.sh)")
+            cmd += ["--vad", "-vm", str(vad_model)]
+        prompt = os.environ.get("TRANSCRIBE_PROMPT")
+        if prompt:
+            cmd += ["--prompt", prompt, "--carry-initial-prompt"]
+        if args.speakers:
+            cmd += ["-oj"]
+
+        label = f" (lang={args.lang}{', VAD' if args.vad else ''})"
+        log(f"transcribing with {model.name}{label}...")
+        if run(cmd).returncode != 0:
+            die("whisper-cli failed")
+
+        txt = out_base.with_suffix(".txt")
+        if not txt.is_file():
+            die("whisper produced no output")
+        log(f"wrote {txt} and {out_base.with_suffix('.srt')}")
+
+        if args.speakers:
+            json_path = out_base.with_suffix(".json")
+            speak_txt = outdir / f"{base}.speakers.txt"
+            speak_srt = outdir / f"{base}.speakers.srt"
+            log("labelling speakers (sherpa-onnx diarization)...")
+            result = run([
+                str(sherpa_python()), str(REPO / "lib" / "speakers.py"),
+                "--wav", str(wav), "--json", str(json_path),
+                "--out-txt", str(speak_txt), "--out-srt", str(speak_srt),
+                "--clusters", str(args.speaker_count or 0),
+                "--models", str(REPO / "models" / "sherpa"),
+            ])
+            if result.returncode != 0:
+                die("speaker labelling failed (see messages above)")
+            log(f"wrote {speak_txt} and {speak_srt}")
+            json_path.unlink(missing_ok=True)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,13 @@
+# Model weights are downloaded by bootstrap.sh, never committed.
+models/
+
+# Isolated environment for the speaker-labelling pass.
+.venv/
+
+# Local scratch
+*.wav
+*.m4a
+*.webm
+__pycache__/
+*.pyc
+.DS_Store
