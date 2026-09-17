@@ -27,6 +27,7 @@ bin/ytx --speakers 2 <file|url>       # hint the speaker count (or --speaker-cou
 bin/ytx --lang en <file|url>          # force a language instead of auto-detect
 bin/ytx --vad <file|url>              # skip silence (recommended for long recordings)
 bin/ytx --keep-audio <file|url>       # also keep the normalised 16 kHz WAV
+bin/ytx --cookies chrome <url>        # uses your logged-in YouTube session
 bin/ytx --help
 ```
 
@@ -64,6 +65,28 @@ same audio resolves to exactly two, matching what you hear. If a recording with
 a known headcount comes out wrong, pass the count explicitly (`--speakers 3`)
 and clustering is bypassed entirely.
 
+## YouTube 403 errors
+
+YouTube intermittently refuses the media request from yt-dlp's default client
+with `HTTP Error 403: Forbidden`, even though metadata extraction succeeds. The
+tool tries three things in order:
+
+1. Your normal request (plus cookies, if configured).
+2. The same request with the `android` player client.
+3. Gives up and tells you to pass cookies.
+
+Passing cookies is the better fix, not just a last resort. Measured on the same
+video: without cookies the default client 403s, and the android fallback
+downloads a 3.5 MB video+audio file; with `--cookies chrome` it succeeds on the
+first try and pulls a 1.2 MB audio-only stream. Cookies also make bot checks far
+less likely on longer videos.
+
+```sh
+bin/ytx --cookies chrome <url>          # or export TRANSCRIBE_COOKIES=chrome
+```
+
+macOS may ask for Keychain access the first time a browser's cookies are read.
+
 ## What has actually been measured
 
 On a 3-minute slice of a two-person interview recording (OBS, dual-mono AAC):
@@ -78,6 +101,31 @@ The alternative `--tinydiarize` route built into whisper.cpp was also tested and
 rejected: it tracks turns well, but it forces the `small.en` model, which turned
 `Mohamad Fahmy` into `Mama Fami`, and its markers are stripped from `.txt`/`.srt`
 output anyway. It is English-only as well.
+
+## Compatibility with the old shell function
+
+This tool replaces a `transcribe` shell function, and was checked against it
+rather than assumed equivalent. Same input through both, outputs byte-compared:
+
+| Scenario | Result |
+| --- | --- |
+| Local file, explicit output dir | `.txt` and `.srt` byte-identical |
+| Local file, no output dir | same destination, `~/Desktop/transcriptions` |
+| Name with spaces and dots (`parity test.v1.mov`) | same output name, byte-identical |
+| YouTube URL with cookies | byte-identical, same derived filename |
+| Scheme-less URL (`youtu.be/...`) | works in both |
+| `TRANSCRIBE_PROMPT` | byte-identical |
+| Missing file | both exit 1 |
+| No arguments | both exit 1 |
+
+Deliberate differences, all additive or cosmetic:
+
+- Usage errors exit 1 rather than argparse's default 2, matching the shell
+  function, but the message is argparse's fuller one.
+- Messages are prefixed `ytx:` rather than `transcribe:`.
+- A title that sanitises to nothing now falls back to `transcript-<timestamp>`.
+  The shell function checked for an empty title *before* sanitising, so an
+  all-punctuation title could write to a bare `.txt`.
 
 ## Limits
 

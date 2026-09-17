@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -85,7 +86,10 @@ def sherpa_python() -> Path:
 def safe_name(text: str) -> str:
     text = text.replace("/", "-")
     text = re.sub(r"[^A-Za-z0-9 ._-]", "", text)
-    return re.sub(r"\s+", "-", text.strip()) or "transcript"
+    cleaned = re.sub(r"\s+", "-", text.strip())
+    # An empty title (rare, but yt-dlp can fail to report one) still needs a
+    # unique name rather than clobbering the previous "transcript.*".
+    return cleaned or time.strftime("transcript-%Y%m%d-%H%M%S")
 
 
 def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -120,12 +124,16 @@ def fetch_url(url: str, workdir: Path) -> tuple[str, Path]:
     title = title[0] if title else ""
 
     template = workdir / "source.%(ext)s"
-    result = run(yt_dlp_base("-f", "bestaudio/best", "-o", str(template), url))
+    result = run(
+        yt_dlp_base("--quiet", "--progress", "-f", "bestaudio/best",
+                    "-o", str(template), url)
+    )
     if result.returncode != 0:
         log("ytx: download failed, retrying with the android player client...")
         result = run(
             yt_dlp_base(
-                *FALLBACK_PLAYER, "-f", "bestaudio/best", "-o", str(template), url
+                *FALLBACK_PLAYER, "--quiet", "--progress",
+                "-f", "bestaudio/best", "-o", str(template), url
             )
         )
     if result.returncode != 0:
@@ -152,8 +160,20 @@ def to_wav16k(src: Path, dest: Path) -> None:
         die(f"ffmpeg could not convert {src}")
 
 
+class Parser(argparse.ArgumentParser):
+    """ArgumentParser that exits 1 on a usage error.
+
+    The shell function this replaces returned 1 for a bad invocation, so keep
+    that for anything checking the exit status.
+    """
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = Parser(
         prog="ytx",
         description="Transcribe a local file or URL. Add --speakers to label who spoke.",
         epilog=(
@@ -186,6 +206,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--keep-audio", action="store_true", help="keep the 16 kHz WAV")
+    parser.add_argument(
+        "--cookies", metavar="BROWSER",
+        help="pull YouTube cookies from a browser, e.g. chrome (same as "
+             "TRANSCRIBE_COOKIES). Fixes bot checks and yields audio-only formats.",
+    )
     return parser.parse_args(normalise_speakers(argv))
 
 
@@ -211,6 +236,10 @@ def normalise_speakers(argv: list[str]) -> list[str]:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+
+    # --cookies and TRANSCRIBE_COOKIES feed the same path, so keep them in sync.
+    if args.cookies:
+        os.environ["TRANSCRIBE_COOKIES"] = args.cookies
 
     if shutil.which("ffmpeg") is None:
         die("ffmpeg not found (brew install ffmpeg)")
@@ -238,7 +267,9 @@ def main(argv: list[str]) -> int:
             src_media = downloaded
         else:
             src_media = Path(source).expanduser()
-            base = safe_name(src_media.stem)
+            # Local files keep their name exactly as the old shell function did;
+            # only titles pulled from the network get sanitised.
+            base = src_media.stem
 
         wav = workdir / "audio.wav"
         log("converting to 16 kHz mono WAV...")
@@ -271,13 +302,16 @@ def main(argv: list[str]) -> int:
         if run(cmd).returncode != 0:
             die("whisper-cli failed")
 
-        txt = out_base.with_suffix(".txt")
+        # Build output paths by appending, never Path.with_suffix(): the stem
+        # may itself contain dots ("recording.v1"), which with_suffix would eat.
+        txt = Path(f"{out_base}.txt")
+        srt = Path(f"{out_base}.srt")
         if not txt.is_file():
             die("whisper produced no output")
-        log(f"wrote {txt} and {out_base.with_suffix('.srt')}")
+        log(f"wrote {txt} and {srt}")
 
         if args.speakers:
-            json_path = out_base.with_suffix(".json")
+            json_path = Path(f"{out_base}.json")
             speak_txt = outdir / f"{base}.speakers.txt"
             speak_srt = outdir / f"{base}.speakers.srt"
             log("labelling speakers (sherpa-onnx diarization)...")
