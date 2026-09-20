@@ -4,6 +4,9 @@ models/
 # Isolated environment for the speaker-labelling pass.
 .venv/
 
+# Windows binaries and download cache (installed by bootstrap.ps1).
+.tools/
+
 # Local scratch
 *.wav
 *.m4a

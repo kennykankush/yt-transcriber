@@ -20,7 +20,29 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 HOME = Path.home()
-DEFAULT_OUT = HOME / "Desktop" / "transcriptions"
+IS_WINDOWS = sys.platform == "win32"
+BOOTSTRAP = r".\bootstrap.ps1" if IS_WINDOWS else "./bootstrap.sh"
+
+
+def desktop_dir() -> Path:
+    if IS_WINDOWS:
+        # The Desktop may be on another drive or redirected into OneDrive.
+        import winreg
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "Desktop")
+            if value:
+                return Path(os.path.expandvars(value))
+        except OSError:
+            pass
+    return HOME / "Desktop"
+
+
+DEFAULT_OUT = desktop_dir() / "transcriptions"
 
 WHISPER_MODELS = ("ggml-large-v3-turbo.bin", "ggml-medium.bin", "ggml-small.bin")
 VAD_MODELS = (
@@ -63,9 +85,20 @@ def whisper_cli() -> Path:
         candidate = Path(os.environ["YTX_WHISPER_CLI"]).expanduser()
         if candidate.is_file():
             return candidate
-    built = HOME / "dev" / "whisperccp" / "build" / "bin" / "whisper-cli"
-    if built.is_file():
-        return built
+    candidates = []
+    if IS_WINDOWS:
+        candidates += [
+            REPO / ".tools" / backend / "Release" / "whisper-cli.exe"
+            for backend in ("whisper-cuda12", "whisper-cpu")
+        ]
+        candidates += [
+            HOME / "dev" / "whisperccp" / "build" / "bin" / subpath
+            for subpath in ("Release/whisper-cli.exe", "whisper-cli.exe")
+        ]
+    candidates.append(HOME / "dev" / "whisperccp" / "build" / "bin" / "whisper-cli")
+    for built in candidates:
+        if built.is_file():
+            return built
     found = shutil.which("whisper-cli")
     if found:
         return Path(found)
@@ -77,16 +110,20 @@ def sherpa_python() -> Path:
         candidate = Path(os.environ["YTX_PYTHON"]).expanduser()
         if candidate.is_file():
             return candidate
-    venv_python = REPO / ".venv" / "bin" / "python"
+    venv_python = REPO / ".venv" / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
     if venv_python.is_file():
         return venv_python
-    die("speaker labels need the sherpa-onnx environment. Run ./bootstrap.sh once.")
+    die(f"speaker labels need the sherpa-onnx environment. Run {BOOTSTRAP} once.")
 
 
 def safe_name(text: str) -> str:
     text = text.replace("/", "-")
     text = re.sub(r"[^A-Za-z0-9 ._-]", "", text)
     cleaned = re.sub(r"\s+", "-", text.strip())
+    if IS_WINDOWS:
+        cleaned = cleaned.rstrip(" .")
+        if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", cleaned, re.I):
+            cleaned = "_" + cleaned
     # An empty title (rare, but yt-dlp can fail to report one) still needs a
     # unique name rather than clobbering the previous "transcript.*".
     return cleaned or time.strftime("transcript-%Y%m%d-%H%M%S")
@@ -98,6 +135,9 @@ def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 def yt_dlp_base(*extra: str) -> list[str]:
     cmd = ["yt-dlp", "--no-warnings", "--no-playlist", *extra]
+    # yt-dlp enables Deno by default; Windows users often already have Node.
+    if IS_WINDOWS and shutil.which("node"):
+        cmd += ["--js-runtimes", "node"]
     if os.environ.get("YTX_YTDLP_ARGS"):
         cmd += shlex.split(os.environ["YTX_YTDLP_ARGS"])
     cookies = os.environ.get("TRANSCRIBE_COOKIES")
@@ -115,11 +155,13 @@ FALLBACK_PLAYER = ["--extractor-args", "youtube:player_client=android"]
 def fetch_url(url: str, workdir: Path) -> tuple[str, Path]:
     """Download a URL's audio with yt-dlp. Returns (title, downloaded file)."""
     if not shutil.which("yt-dlp"):
-        die("yt-dlp not installed (brew install yt-dlp)")
+        die(f"yt-dlp not installed (run {BOOTSTRAP})" if IS_WINDOWS
+            else "yt-dlp not installed (brew install yt-dlp)")
     title = run(
         yt_dlp_base("--print", "%(title)s", url),
         capture_output=True,
         text=True,
+        encoding="utf-8",
     ).stdout.strip().splitlines()
     title = title[0] if title else ""
 
@@ -139,7 +181,7 @@ def fetch_url(url: str, workdir: Path) -> tuple[str, Path]:
     if result.returncode != 0:
         log(
             "ytx: download failed. If YouTube is asking you to confirm you're not a bot, "
-            "retry with TRANSCRIBE_COOKIES=chrome ytx ..."
+            "retry with --cookies chrome."
         )
         raise SystemExit(1)
 
@@ -158,6 +200,17 @@ def to_wav16k(src: Path, dest: Path) -> None:
     )
     if result.returncode != 0:
         die(f"ffmpeg could not convert {src}")
+
+
+def copy_whisper_outputs(source: Path, destination: Path, speakers: bool) -> None:
+    """Publish Windows outputs using Python's Unicode-aware filesystem APIs."""
+    suffixes = [".txt", ".srt"] + ([".json"] if speakers else [])
+    # Check the fresh outputs before touching any previous transcription.
+    for suffix in suffixes:
+        if not Path(f"{source}{suffix}").is_file():
+            die(f"whisper produced no {suffix} output")
+    for suffix in suffixes:
+        shutil.copy2(Path(f"{source}{suffix}"), Path(f"{destination}{suffix}"))
 
 
 class Parser(argparse.ArgumentParser):
@@ -184,7 +237,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("source", help="local media file or URL")
     parser.add_argument(
         "output_dir", nargs="?", default=os.environ.get("YTX_OUT", str(DEFAULT_OUT)),
-        help=f"where to write results (default: {DEFAULT_OUT})",
+        help="where to write results (default: %(default)s)",
     )
     parser.add_argument(
         "--speakers", action="store_true",
@@ -242,7 +295,8 @@ def main(argv: list[str]) -> int:
         os.environ["TRANSCRIBE_COOKIES"] = args.cookies
 
     if shutil.which("ffmpeg") is None:
-        die("ffmpeg not found (brew install ffmpeg)")
+        die("ffmpeg not found (winget install --id Gyan.FFmpeg -e)" if IS_WINDOWS
+            else "ffmpeg not found (brew install ffmpeg)")
 
     model = Path(args.model).expanduser() if args.model else find_model(WHISPER_MODELS)
     if not model or not model.is_file():
@@ -278,9 +332,13 @@ def main(argv: list[str]) -> int:
             shutil.copy2(wav, outdir / f"{base}.wav")
 
         out_base = outdir / base
+        # The Windows binary uses narrow argv for output names. Let it write
+        # simple names in its working directory, then publish via Python.
+        whisper_base = workdir / "transcript" if IS_WINDOWS else out_base
         cmd = [
-            str(whisper_cli()), "-m", str(model), "-f", str(wav),
-            "-otxt", "-osrt", "-of", str(out_base),
+            str(whisper_cli().resolve()), "-m", str(model.resolve()),
+            "-f", wav.name if IS_WINDOWS else str(wav),
+            "-otxt", "-osrt", "-of", whisper_base.name if IS_WINDOWS else str(whisper_base),
             "-l", args.lang, "-t", str(args.threads), "-pp",
         ]
         if args.vad:
@@ -289,8 +347,8 @@ def main(argv: list[str]) -> int:
                 if os.environ.get("TRANSCRIBE_VAD_MODEL") else None
             )
             if not vad_model or not vad_model.is_file():
-                die("--vad requested but no Silero VAD model found (run ./bootstrap.sh)")
-            cmd += ["--vad", "-vm", str(vad_model)]
+                die(f"--vad requested but no Silero VAD model found (run {BOOTSTRAP})")
+            cmd += ["--vad", "-vm", str(vad_model.resolve())]
         prompt = os.environ.get("TRANSCRIBE_PROMPT")
         if prompt:
             cmd += ["--prompt", prompt, "--carry-initial-prompt"]
@@ -299,8 +357,10 @@ def main(argv: list[str]) -> int:
 
         label = f" (lang={args.lang}{', VAD' if args.vad else ''})"
         log(f"transcribing with {model.name}{label}...")
-        if run(cmd).returncode != 0:
+        if run(cmd, **({"cwd": workdir} if IS_WINDOWS else {})).returncode != 0:
             die("whisper-cli failed")
+        if IS_WINDOWS:
+            copy_whisper_outputs(whisper_base, out_base, args.speakers)
 
         # Build output paths by appending, never Path.with_suffix(): the stem
         # may itself contain dots ("recording.v1"), which with_suffix would eat.

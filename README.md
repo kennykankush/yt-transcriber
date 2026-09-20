@@ -8,6 +8,8 @@ never touches the transcript text, so labels cost you nothing in accuracy.
 
 ## Install
 
+### macOS / Linux
+
 ```sh
 ./bootstrap.sh                  # tools + speaker models + python venv
 ./bootstrap.sh --with-whisper-model   # ...and the 1.6 GB whisper model
@@ -17,6 +19,70 @@ Requirements: `ffmpeg`, `yt-dlp`, and a built
 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli`). Models are
 never committed to this repo - `bootstrap.sh` fetches them into `models/`, which
 is gitignored. Existing models in `~/dev/whisperccp/models` are reused as-is.
+
+### Windows (x64)
+
+Use PowerShell with Python 3.12 (or [uv](https://docs.astral.sh/uv/)) and FFmpeg
+on PATH. To install those prerequisites with WinGet:
+
+```powershell
+winget install --id astral-sh.uv -e
+winget install --id Gyan.FFmpeg -e
+```
+
+Open a new PowerShell window, clone this repo, and run:
+
+```powershell
+git clone https://github.com/kennykankush/yt-transcriber.git
+cd yt-transcriber
+.\bootstrap.ps1 -WithWhisperModel -InstallCommand
+```
+
+For an NVIDIA GPU, add `-Cuda` to install the bundled CUDA 12.4 build:
+
+```powershell
+.\bootstrap.ps1 -WithWhisperModel -Cuda -InstallCommand
+```
+
+An NVIDIA driver supporting CUDA 12.4 is required; a separate CUDA toolkit is
+not needed. Without `-Cuda`, Whisper runs on the CPU. If both builds are
+installed, the launcher prefers CUDA; `YTX_WHISPER_CLI` can override the choice.
+
+The installer creates `.venv`, installs yt-dlp and the speaker dependencies,
+downloads Whisper and the speaker/VAD models, and reuses existing files on
+later runs. `-WithWhisperModel` downloads the roughly 1.6 GB transcription model
+if no supported model is found. Binaries and models are gitignored.
+`-SkipModels` installs tools only, useful for setup checks.
+
+`-InstallCommand` adds this checkout's `bin` directory to your user PATH.
+Open a new terminal if necessary, then use **`transcribe` from any folder**:
+
+```powershell
+transcribe "https://www.youtube.com/watch?v=VIDEO_ID"
+transcribe "D:\recordings\interview.mp4"
+transcribe --speakers 2 --vad "D:\recordings\interview.mp4"
+transcribe "D:\recordings\interview.mp4" "D:\transcripts"
+```
+
+No environment activation is needed. Without `-InstallCommand`, run
+`.\bin\transcribe.cmd` from the checkout. Keep the checkout in place, or rerun
+the installer and remove the old PATH entry if you move it.
+
+For YouTube, also install a supported JavaScript runtime: Node.js 22+ or Deno.
+The Windows launcher enables Node automatically when it is on PATH; yt-dlp
+enables Deno by default. Browser-cookie access depends on browser and OS
+restrictions; it is not guaranteed to resolve every YouTube download error.
+
+If PowerShell blocks the installer under your execution policy, run it for
+this process only (add `-Cuda` for NVIDIA):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1 -WithWhisperModel -InstallCommand
+```
+
+Keep the checkout and Whisper model paths free of non-ASCII characters: the
+bundled Whisper binary still has limitations with those paths. Media filenames,
+output filenames, and transcript text can contain non-ASCII characters.
 
 ## Usage
 
@@ -32,6 +98,8 @@ bin/ytx --help
 ```
 
 Results land in `~/Desktop/transcriptions` unless you pass an output directory.
+On Windows, this follows your actual Desktop location, including a redirected
+drive or OneDrive folder. `YTX_OUT` overrides the default on all platforms.
 
 ## Environment variables
 
@@ -39,8 +107,9 @@ Results land in `~/Desktop/transcriptions` unless you pass an output directory.
 | --- | --- |
 | `YTX_MODELS` | extra directory to search for models, checked first |
 | `YTX_WHISPER_CLI` | path to `whisper-cli` |
-| `YTX_PYTHON` | python interpreter that has sherpa-onnx (default `.venv/bin/python`) |
+| `YTX_PYTHON` | python interpreter that has sherpa-onnx (default `.venv/bin/python`, or `.venv\Scripts\python.exe` on Windows) |
 | `YTX_OUT` | default output directory |
+| `YTX_YTDLP_ARGS` | extra yt-dlp options; parsed with shell-style quoting (use forward slashes in Windows paths) |
 | `TRANSCRIBE_LANG` | default spoken language (same as `--lang`) |
 | `TRANSCRIBE_VAD` | set to 1 to default `--vad` on |
 | `TRANSCRIBE_PROMPT` | nudge spelling of names and jargon |
@@ -88,6 +157,11 @@ bin/ytx --cookies chrome <url>          # or export TRANSCRIBE_COOKIES=chrome
 macOS may ask for Keychain access the first time a browser's cookies are read.
 
 ## What has actually been measured
+
+Windows 11 installation was checked on an RTX 3070 Ti with whisper.cpp b5130
+(CUDA 12.4): local WAV input and a public YouTube URL both produced `.txt`,
+`.srt`, `.speakers.txt`, and `.speakers.srt` outputs. GPU use was confirmed in
+Whisper's logs. These are execution checks, not speaker-count accuracy claims.
 
 On a 3-minute slice of a two-person interview recording (OBS, dual-mono AAC):
 

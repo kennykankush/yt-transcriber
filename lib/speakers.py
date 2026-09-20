@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import wave
 from pathlib import Path
@@ -39,7 +40,8 @@ def diarize(samples: np.ndarray, models: Path, clusters: int, threshold: float):
     emb_model = models / EMB_MODEL
     for path in (seg_model, emb_model):
         if not path.is_file():
-            raise SystemExit(f"speakers.py: missing model {path} (run ./bootstrap.sh)")
+            setup = r".\bootstrap.ps1" if os.name == "nt" else "./bootstrap.sh"
+            raise SystemExit(f"speakers.py: missing model {path} (run {setup})")
 
     config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
@@ -62,7 +64,7 @@ def diarize(samples: np.ndarray, models: Path, clusters: int, threshold: float):
 
 
 def load_whisper_segments(path: Path) -> list[tuple[float, float, str]]:
-    with path.open() as fh:
+    with path.open(encoding="utf-8") as fh:
         data = json.load(fh)
     segments = []
     for entry in data.get("transcription", []):
@@ -176,8 +178,8 @@ def main(argv: list[str]) -> int:
     labelled = label_segments(load_whisper_segments(Path(args.json)), turns)
     transcript, srt = render(labelled)
 
-    Path(args.out_txt).write_text(transcript)
-    Path(args.out_srt).write_text(srt)
+    Path(args.out_txt).write_text(transcript, encoding="utf-8")
+    Path(args.out_srt).write_text(srt, encoding="utf-8")
     return 0
 
 
